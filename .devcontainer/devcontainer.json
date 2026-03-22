@@ -1,5 +1,5 @@
 {
-  "name": "workflow-orchestration-queue-charlie80-b",
+  "name": "workflow-orchestration-queue-charlie80-b-devcontainer",
   "image": "ghcr.io/intel-agency/workflow-orchestration-queue-charlie80-b/devcontainer:main-latest",
   "containerEnv": {
     "DOTNET_ROOT": "/usr/share/dotnet"
