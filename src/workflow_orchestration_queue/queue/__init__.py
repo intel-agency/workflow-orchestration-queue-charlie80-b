@@ -1,3 +1,5 @@
 """Queue management for workflow orchestration."""
 
-# Placeholder module - queue implementations to be added in future stories
+from workflow_orchestration_queue.queue.github_queue import GitHubQueue, ITaskQueue
+
+__all__ = ["ITaskQueue", "GitHubQueue"]

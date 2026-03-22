@@ -1,3 +1,10 @@
 """Data models for workflow orchestration."""
 
-# Placeholder module - models to be added in future stories
+from workflow_orchestration_queue.models.work_item import (
+    TaskType,
+    WorkItem,
+    WorkItemStatus,
+    scrub_secrets,
+)
+
+__all__ = ["TaskType", "WorkItem", "WorkItemStatus", "scrub_secrets"]
