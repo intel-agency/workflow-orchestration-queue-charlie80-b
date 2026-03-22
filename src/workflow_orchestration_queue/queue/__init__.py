@@ -1,3 +1,13 @@
 """Queue management for workflow orchestration."""
 
-# Placeholder module - queue implementations to be added in future stories
+from workflow_orchestration_queue.queue.http_client import (
+    GitHubHttpClient,
+    close_github_client,
+    get_github_client,
+)
+
+__all__ = [
+    "GitHubHttpClient",
+    "close_github_client",
+    "get_github_client",
+]

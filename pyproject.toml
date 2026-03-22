@@ -24,6 +24,7 @@ classifiers = [
 dependencies = [
     "fastapi>=0.115.0",
     "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
     "httpx>=0.28.0",
     "uvicorn[standard]>=0.32.0",
 ]
@@ -35,6 +36,10 @@ dev = [
     "ruff>=0.8.0",
     "mypy>=1.13.0",
 ]
+
+[project.scripts]
+notifier = "workflow_orchestration_queue.notifier_service:run"
+sentinel = "workflow_orchestration_queue.orchestrator_sentinel:run"
 
 [project.urls]
 Homepage = "https://github.com/intel-agency/workflow-orchestration-queue-charlie80-b"
@@ -73,6 +78,9 @@ ignore = [
     "B008",   # do not perform function calls in argument defaults
 ]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG001", "ARG002"]  # Unused arguments in test fixtures
+
 [tool.ruff.lint.isort]
 known-first-party = ["workflow_orchestration_queue"]
 
@@ -86,6 +94,7 @@ line-ending = "auto"
 [tool.mypy]
 python_version = "3.12"
 strict = true
+mypy_path = "src"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
