@@ -1,0 +1,51 @@
+# OS-APOW Docker Compose Configuration
+# Local development and multi-service orchestration
+
+services:
+  notifier:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: os-apow-notifier
+    ports:
+      - "8000:8000"
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - GITHUB_ORG=${GITHUB_ORG:-intel-agency}
+      - GITHUB_REPO=${GITHUB_REPO:-workflow-orchestration-queue-charlie80-b}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - os-apow-network
+
+  sentinel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: os-apow-sentinel
+    command: ["python", "-m", "src.orchestrator_sentinel"]
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_ORG=${GITHUB_ORG:-intel-agency}
+      - GITHUB_REPO=${GITHUB_REPO:-workflow-orchestration-queue-charlie80-b}
+      - SENTINEL_BOT_LOGIN=${SENTINEL_BOT_LOGIN:-}
+      - SENTINEL_POLL_INTERVAL=${SENTINEL_POLL_INTERVAL:-60}
+    volumes:
+      - ./scripts:/app/scripts:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      notifier:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - os-apow-network
+
+networks:
+  os-apow-network:
+    driver: bridge
