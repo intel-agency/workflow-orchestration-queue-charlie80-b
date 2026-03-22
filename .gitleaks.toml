@@ -1,0 +1,18 @@
+# Gitleaks configuration for workflow-orchestration-queue-charlie80-b
+# https://github.com/gitleaks/gitleaks#configuration
+
+title = "Gitleaks configuration"
+
+[allowlist]
+description = "Allowlist for test fixtures and secret pattern definitions"
+paths = [
+    # Test files contain fake secret patterns for testing scrub_secrets()
+    '''tests/test_work_item\.py''',
+    '''tests/test_github_queue\.py''',
+    # Source code contains regex patterns for detecting secrets (not actual secrets)
+    '''src/workflow_orchestration_queue/models/work_item\.py''',
+    # Plan docs may contain example patterns
+    '''plan_docs/.*''',
+    # Scripts directory may contain reference implementations
+    '''scripts/.*\.py''',
+]
