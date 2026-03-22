@@ -5,8 +5,11 @@ Tests cover:
 - fetch_queued_tasks() with mock httpx
 - update_status() label transitions
 - claim_task() distributed locking
+- claim_task_with_retry() with exponential backoff
 - Rate limit handling (403/429)
 - Connection pool cleanup
+- LockingConfig from environment
+- API error handling (404, 403, 422)
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,7 +22,14 @@ from workflow_orchestration_queue.models.work_item import (
     WorkItem,
     WorkItemStatus,
 )
-from workflow_orchestration_queue.queue.github_queue import GitHubQueue, ITaskQueue
+from workflow_orchestration_queue.queue.github_queue import (
+    AssignmentError,
+    ContentionError,
+    GitHubQueue,
+    ITaskQueue,
+    LockingConfig,
+    VerificationError,
+)
 
 
 @pytest.fixture
@@ -32,7 +42,8 @@ def mock_httpx_client():
 @pytest.fixture
 def github_queue(mock_httpx_client):
     """Create a GitHubQueue instance with mocked client."""
-    queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo")
+    config = LockingConfig(bot_login="")  # Default config without bot login
+    queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
     queue._client = mock_httpx_client
     return queue
 
@@ -489,22 +500,28 @@ class TestClaimTask:
 
     @pytest.mark.asyncio
     @pytest.mark.unit
-    async def test_claim_task_assignment_fails(
-        self, github_queue, mock_httpx_client, sample_work_item
-    ):
-        """Test claim when assignment fails."""
+    async def test_claim_task_assignment_fails(self, mock_httpx_client, sample_work_item):
+        """Test claim when assignment fails with non-specific error."""
+        config = LockingConfig(bot_login="my-bot")
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
         mock_assign_response = MagicMock()
-        mock_assign_response.status_code = 422
+        mock_assign_response.status_code = 500  # Generic server error (not 404/403/422)
         mock_httpx_client.post.return_value = mock_assign_response
 
-        result = await github_queue.claim_task(sample_work_item, "sentinel-1", bot_login="my-bot")
+        result = await queue.claim_task(sample_work_item, "sentinel-1")
 
         assert result is False
 
     @pytest.mark.asyncio
     @pytest.mark.unit
-    async def test_claim_task_lost_race(self, github_queue, mock_httpx_client, sample_work_item):
+    async def test_claim_task_lost_race(self, mock_httpx_client, sample_work_item):
         """Test claim when we lose the race to another sentinel."""
+        config = LockingConfig(bot_login="my-bot")
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
         mock_assign_response = MagicMock()
         mock_assign_response.status_code = 201
 
@@ -516,14 +533,17 @@ class TestClaimTask:
         mock_httpx_client.post.return_value = mock_assign_response
         mock_httpx_client.get.return_value = mock_verify_response
 
-        result = await github_queue.claim_task(sample_work_item, "sentinel-1", bot_login="my-bot")
-
-        assert result is False
+        with pytest.raises(ContentionError):
+            await queue.claim_task(sample_work_item, "sentinel-1")
 
     @pytest.mark.asyncio
     @pytest.mark.unit
-    async def test_claim_task_verify_fails(self, github_queue, mock_httpx_client, sample_work_item):
+    async def test_claim_task_verify_fails(self, mock_httpx_client, sample_work_item):
         """Test claim when verify request fails."""
+        config = LockingConfig(bot_login="my-bot")
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
         mock_assign_response = MagicMock()
         mock_assign_response.status_code = 201
 
@@ -533,16 +553,17 @@ class TestClaimTask:
         mock_httpx_client.post.return_value = mock_assign_response
         mock_httpx_client.get.return_value = mock_verify_response
 
-        result = await github_queue.claim_task(sample_work_item, "sentinel-1", bot_login="my-bot")
-
-        assert result is False
+        with pytest.raises(VerificationError):
+            await queue.claim_task(sample_work_item, "sentinel-1")
 
     @pytest.mark.asyncio
     @pytest.mark.unit
-    async def test_claim_task_label_delete_fails(
-        self, github_queue, mock_httpx_client, sample_work_item
-    ):
+    async def test_claim_task_label_delete_fails(self, mock_httpx_client, sample_work_item):
         """Test claim when label deletion fails."""
+        config = LockingConfig(bot_login="my-bot")
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
         mock_assign_response = MagicMock()
         mock_assign_response.status_code = 201
 
@@ -557,7 +578,7 @@ class TestClaimTask:
         mock_httpx_client.get.return_value = mock_verify_response
         mock_httpx_client.delete.return_value = mock_delete_response
 
-        result = await github_queue.claim_task(sample_work_item, "sentinel-1", bot_login="my-bot")
+        result = await queue.claim_task(sample_work_item, "sentinel-1")
 
         assert result is False
 
@@ -600,8 +621,6 @@ class TestITaskQueueInterface:
     @pytest.mark.unit
     def test_interface_has_required_methods(self):
         """Test that ITaskQueue defines required abstract methods."""
-        import inspect
-
         # Check abstract methods exist
         abstract_methods = ITaskQueue.__abstractmethods__
         assert "add_to_queue" in abstract_methods
@@ -623,3 +642,653 @@ class TestRepoApiUrl:
         """Test _repo_api_url with org/repo containing special characters."""
         url = github_queue._repo_api_url("my-org/my-repo-123")
         assert url == "https://api.github.com/repos/my-org/my-repo-123"
+
+
+class TestLockingConfig:
+    """Tests for LockingConfig dataclass."""
+
+    @pytest.mark.unit
+    def test_default_values(self):
+        """Test default configuration values."""
+        config = LockingConfig()
+        assert config.api_timeout == 30.0
+        assert config.bot_login == ""
+        assert config.max_retry_attempts == 3
+        assert config.initial_backoff_ms == 100
+        assert config.max_backoff_ms == 2000
+        assert config.backoff_multiplier == 2.0
+
+    @pytest.mark.unit
+    def test_custom_values(self):
+        """Test custom configuration values."""
+        config = LockingConfig(
+            api_timeout=60.0,
+            bot_login="my-bot",
+            max_retry_attempts=5,
+            initial_backoff_ms=200,
+            max_backoff_ms=5000,
+            backoff_multiplier=1.5,
+        )
+        assert config.api_timeout == 60.0
+        assert config.bot_login == "my-bot"
+        assert config.max_retry_attempts == 5
+        assert config.initial_backoff_ms == 200
+        assert config.max_backoff_ms == 5000
+        assert config.backoff_multiplier == 1.5
+
+    @pytest.mark.unit
+    def test_from_env_defaults(self):
+        """Test from_env with no environment variables set."""
+        with patch.dict("os.environ", {}, clear=True):
+            config = LockingConfig.from_env()
+            assert config.api_timeout == 30.0
+            assert config.bot_login == ""
+            assert config.max_retry_attempts == 3
+
+    @pytest.mark.unit
+    def test_from_env_custom_values(self):
+        """Test from_env with custom environment variables."""
+        env = {
+            "GITHUB_API_TIMEOUT": "45.0",
+            "SENTINEL_BOT_LOGIN": "env-bot",
+            "LOCK_RETRY_MAX_ATTEMPTS": "5",
+            "LOCK_RETRY_INITIAL_BACKOFF_MS": "150",
+            "LOCK_RETRY_MAX_BACKOFF_MS": "3000",
+            "LOCK_RETRY_BACKOFF_MULTIPLIER": "1.5",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            config = LockingConfig.from_env()
+            assert config.api_timeout == 45.0
+            assert config.bot_login == "env-bot"
+            assert config.max_retry_attempts == 5
+            assert config.initial_backoff_ms == 150
+            assert config.max_backoff_ms == 3000
+            assert config.backoff_multiplier == 1.5
+
+    @pytest.mark.unit
+    def test_github_queue_uses_config_timeout(self):
+        """Test that GitHubQueue uses config timeout."""
+        import asyncio
+
+        config = LockingConfig(api_timeout=45.0)
+        queue = GitHubQueue(token="test-token", config=config)
+        # The client should have the config timeout
+        assert queue._client is not None
+        # httpx wraps timeout in a Timeout object
+        assert queue._client.timeout == httpx.Timeout(45.0)
+        # Clean up
+        asyncio.get_event_loop().run_until_complete(queue.close())
+
+
+class TestClaimTaskWithRetry:
+    """Tests for claim_task_with_retry method."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_claim_task_with_retry_success_first_attempt(
+        self, mock_httpx_client, sample_work_item
+    ):
+        """Test successful claim on first attempt."""
+        config = LockingConfig(max_retry_attempts=3)
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
+        # Mock successful assignment
+        mock_assign_response = MagicMock()
+        mock_assign_response.status_code = 201
+
+        # Mock verify response
+        mock_verify_response = MagicMock()
+        mock_verify_response.status_code = 200
+        mock_verify_response.json.return_value = {"assignees": [{"login": "my-bot"}]}
+
+        # Mock label operations
+        mock_delete_response = MagicMock()
+        mock_delete_response.status_code = 200
+
+        mock_httpx_client.post.return_value = mock_assign_response
+        mock_httpx_client.get.return_value = mock_verify_response
+        mock_httpx_client.delete.return_value = mock_delete_response
+
+        result = await queue.claim_task_with_retry(sample_work_item, "sentinel-1", "my-bot")
+
+        assert result is True
+        # Should only be called once (no retries)
+        assert mock_httpx_client.post.call_count >= 2  # assign + labels + comment
+
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_claim_task_with_retry_success_after_contention(
+        self, mock_httpx_client, sample_work_item
+    ):
+        """Test successful claim after retry on contention."""
+        config = LockingConfig(
+            max_retry_attempts=3,
+            initial_backoff_ms=10,  # Fast for testing
+        )
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
+        # First attempt: contention (other assignee)
+        mock_assign_response_1 = MagicMock()
+        mock_assign_response_1.status_code = 201
+
+        mock_verify_response_1 = MagicMock()
+        mock_verify_response_1.status_code = 200
+        mock_verify_response_1.json.return_value = {"assignees": [{"login": "other-bot"}]}
+
+        # Second attempt: success
+        mock_assign_response_2 = MagicMock()
+        mock_assign_response_2.status_code = 201
+
+        mock_verify_response_2 = MagicMock()
+        mock_verify_response_2.status_code = 200
+        mock_verify_response_2.json.return_value = {"assignees": [{"login": "my-bot"}]}
+
+        mock_delete_response = MagicMock()
+        mock_delete_response.status_code = 200
+
+        # Setup sequence of responses
+        mock_httpx_client.post.side_effect = [
+            mock_assign_response_1,
+            mock_assign_response_2,
+            MagicMock(),  # label post
+            MagicMock(),  # comment post
+        ]
+        mock_httpx_client.get.side_effect = [mock_verify_response_1, mock_verify_response_2]
+        mock_httpx_client.delete.return_value = mock_delete_response
+
+        result = await queue.claim_task_with_retry(sample_work_item, "sentinel-1", "my-bot")
+
+        assert result is True
+        # Should have two assignment attempts
+        assert mock_httpx_client.get.call_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_claim_task_with_retry_exhausted(self, mock_httpx_client, sample_work_item):
+        """Test that retries are exhausted after max attempts."""
+        config = LockingConfig(
+            max_retry_attempts=3,
+            initial_backoff_ms=10,  # Fast for testing
+        )
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
+        # All attempts: contention
+        mock_assign_response = MagicMock()
+        mock_assign_response.status_code = 201
+
+        mock_verify_response = MagicMock()
+        mock_verify_response.status_code = 200
+        mock_verify_response.json.return_value = {"assignees": [{"login": "other-bot"}]}
+
+        mock_httpx_client.post.return_value = mock_assign_response
+        mock_httpx_client.get.return_value = mock_verify_response
+
+        result = await queue.claim_task_with_retry(sample_work_item, "sentinel-1", "my-bot")
+
+        assert result is False
+        # Should have 3 assignment attempts
+        assert mock_httpx_client.get.call_count == 3
+
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_claim_task_with_retry_no_retry_on_assignment_error(
+        self, mock_httpx_client, sample_work_item
+    ):
+        """Test that AssignmentError is not retried."""
+        config = LockingConfig(max_retry_attempts=3)
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
+        # 404 error
+        mock_assign_response = MagicMock()
+        mock_assign_response.status_code = 404
+
+        mock_httpx_client.post.return_value = mock_assign_response
+
+        with pytest.raises(AssignmentError) as exc_info:
+            await queue.claim_task_with_retry(sample_work_item, "sentinel-1", "my-bot")
+
+        assert exc_info.value.issue_number == sample_work_item.issue_number
+        assert exc_info.value.context.get("status_code") == 404
+        # Should only be called once (no retry)
+        assert mock_httpx_client.post.call_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_claim_task_with_retry_no_retry_on_verification_error(
+        self, mock_httpx_client, sample_work_item
+    ):
+        """Test that VerificationError is not retried."""
+        config = LockingConfig(max_retry_attempts=3)
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
+        mock_assign_response = MagicMock()
+        mock_assign_response.status_code = 201
+
+        mock_verify_response = MagicMock()
+        mock_verify_response.status_code = 500  # Server error on verify
+
+        mock_httpx_client.post.return_value = mock_assign_response
+        mock_httpx_client.get.return_value = mock_verify_response
+
+        with pytest.raises(VerificationError) as exc_info:
+            await queue.claim_task_with_retry(sample_work_item, "sentinel-1", "my-bot")
+
+        assert exc_info.value.issue_number == sample_work_item.issue_number
+        # Should only be called once (no retry)
+        assert mock_httpx_client.get.call_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_claim_task_with_retry_uses_config_bot_login(
+        self, mock_httpx_client, sample_work_item
+    ):
+        """Test that config bot_login is used when not provided."""
+        config = LockingConfig(bot_login="config-bot")
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
+        mock_assign_response = MagicMock()
+        mock_assign_response.status_code = 201
+
+        mock_verify_response = MagicMock()
+        mock_verify_response.status_code = 200
+        mock_verify_response.json.return_value = {"assignees": [{"login": "config-bot"}]}
+
+        mock_delete_response = MagicMock()
+        mock_delete_response.status_code = 200
+
+        mock_httpx_client.post.return_value = mock_assign_response
+        mock_httpx_client.get.return_value = mock_verify_response
+        mock_httpx_client.delete.return_value = mock_delete_response
+
+        result = await queue.claim_task_with_retry(
+            sample_work_item, "sentinel-1"
+        )  # No bot_login provided
+
+        assert result is True
+        # Check that config bot was used
+        call_args = mock_httpx_client.post.call_args_list[0]
+        assert "config-bot" in str(call_args)
+
+
+class TestAPIErrorHandling:
+    """Tests for specific API error handling."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_claim_task_404_not_found(self, mock_httpx_client, sample_work_item):
+        """Test 404 Not Found error handling."""
+        config = LockingConfig(bot_login="my-bot")
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
+        mock_assign_response = MagicMock()
+        mock_assign_response.status_code = 404
+
+        mock_httpx_client.post.return_value = mock_assign_response
+
+        with pytest.raises(AssignmentError) as exc_info:
+            await queue.claim_task(sample_work_item, "sentinel-1")
+
+        assert "not found" in str(exc_info.value).lower()
+        assert exc_info.value.context.get("status_code") == 404
+
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_claim_task_403_forbidden(self, mock_httpx_client, sample_work_item):
+        """Test 403 Forbidden error handling."""
+        config = LockingConfig(bot_login="my-bot")
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
+        mock_assign_response = MagicMock()
+        mock_assign_response.status_code = 403
+
+        mock_httpx_client.post.return_value = mock_assign_response
+
+        with pytest.raises(AssignmentError) as exc_info:
+            await queue.claim_task(sample_work_item, "sentinel-1")
+
+        assert "permission denied" in str(exc_info.value).lower()
+        assert exc_info.value.context.get("status_code") == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_claim_task_422_validation_error(self, mock_httpx_client, sample_work_item):
+        """Test 422 Unprocessable Entity error handling."""
+        config = LockingConfig(bot_login="my-bot")
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
+        mock_assign_response = MagicMock()
+        mock_assign_response.status_code = 422
+        mock_assign_response.text = '{"message": "Validation failed"}'
+
+        mock_httpx_client.post.return_value = mock_assign_response
+
+        with pytest.raises(AssignmentError) as exc_info:
+            await queue.claim_task(sample_work_item, "sentinel-1")
+
+        assert "validation error" in str(exc_info.value).lower()
+        assert exc_info.value.context.get("status_code") == 422
+
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_claim_task_network_error_on_assignment(
+        self, mock_httpx_client, sample_work_item
+    ):
+        """Test network error handling during assignment."""
+        config = LockingConfig(bot_login="my-bot")
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
+        mock_httpx_client.post.side_effect = httpx.ConnectError("Connection refused")
+
+        with pytest.raises(AssignmentError) as exc_info:
+            await queue.claim_task(sample_work_item, "sentinel-1")
+
+        assert "network error" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_claim_task_network_error_on_verification(
+        self, mock_httpx_client, sample_work_item
+    ):
+        """Test network error handling during verification."""
+        config = LockingConfig(bot_login="my-bot")
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
+        mock_assign_response = MagicMock()
+        mock_assign_response.status_code = 201
+
+        mock_httpx_client.post.return_value = mock_assign_response
+        mock_httpx_client.get.side_effect = httpx.ReadTimeout("Read timed out")
+
+        with pytest.raises(VerificationError) as exc_info:
+            await queue.claim_task(sample_work_item, "sentinel-1")
+
+        assert "network error" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_claim_task_verification_server_error(self, mock_httpx_client, sample_work_item):
+        """Test server error during verification."""
+        config = LockingConfig(bot_login="my-bot")
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
+        mock_assign_response = MagicMock()
+        mock_assign_response.status_code = 201
+
+        mock_verify_response = MagicMock()
+        mock_verify_response.status_code = 500
+        mock_verify_response.text = "Internal server error"
+
+        mock_httpx_client.post.return_value = mock_assign_response
+        mock_httpx_client.get.return_value = mock_verify_response
+
+        with pytest.raises(VerificationError) as exc_info:
+            await queue.claim_task(sample_work_item, "sentinel-1")
+
+        assert exc_info.value.context.get("status_code") == 500
+
+
+class TestBackoffStrategy:
+    """Tests for exponential backoff calculation."""
+
+    @pytest.mark.unit
+    def test_backoff_increases_exponentially(self):
+        """Test that backoff increases with each attempt."""
+        config = LockingConfig(
+            initial_backoff_ms=100,
+            max_backoff_ms=10000,
+            backoff_multiplier=2.0,
+        )
+        queue = GitHubQueue(token="test-token", config=config)
+
+        # Get multiple backoff values (without jitter for comparison)
+        backoffs = []
+        for attempt in range(5):
+            # Run multiple times to get average (due to jitter)
+            samples = [queue._calculate_backoff(attempt) for _ in range(100)]
+            avg_backoff = sum(samples) / len(samples)
+            backoffs.append(avg_backoff)
+
+        # Backoff should increase (approximately) exponentially
+        assert backoffs[1] > backoffs[0]
+        assert backoffs[2] > backoffs[1]
+        assert backoffs[3] > backoffs[2]
+
+    @pytest.mark.unit
+    def test_backoff_respects_max(self):
+        """Test that backoff is capped at max_backoff_ms."""
+        config = LockingConfig(
+            initial_backoff_ms=100,
+            max_backoff_ms=500,  # Low max for testing
+            backoff_multiplier=2.0,
+        )
+        queue = GitHubQueue(token="test-token", config=config)
+
+        # Even at high attempt numbers, backoff should not exceed max
+        for attempt in range(10):
+            backoff = queue._calculate_backoff(attempt)
+            # Max backoff + 25% jitter = 625ms max
+            assert backoff <= 0.65  # 650ms in seconds
+
+    @pytest.mark.unit
+    def test_backoff_has_jitter(self):
+        """Test that jitter is added to backoff."""
+        config = LockingConfig(
+            initial_backoff_ms=100,
+            max_backoff_ms=10000,
+            backoff_multiplier=2.0,
+        )
+        queue = GitHubQueue(token="test-token", config=config)
+
+        # Get multiple samples for same attempt
+        samples = [queue._calculate_backoff(0) for _ in range(100)]
+
+        # Samples should vary (jitter)
+        unique_values = set(samples)
+        assert len(unique_values) > 1  # Should have variation
+
+        # All samples should be within expected range
+        # Base: 100ms, jitter: 0-25%, so 100-125ms = 0.1-0.125s
+        for sample in samples:
+            assert 0.1 <= sample <= 0.125
+
+    @pytest.mark.unit
+    def test_backoff_first_attempt(self):
+        """Test backoff for first attempt (attempt 0)."""
+        config = LockingConfig(
+            initial_backoff_ms=100,
+            max_backoff_ms=10000,
+            backoff_multiplier=2.0,
+        )
+        queue = GitHubQueue(token="test-token", config=config)
+
+        backoff = queue._calculate_backoff(0)
+        # 100ms + 0-25% jitter = 0.1-0.125s
+        assert 0.1 <= backoff <= 0.125
+
+    @pytest.mark.unit
+    def test_backoff_second_attempt(self):
+        """Test backoff for second attempt (attempt 1)."""
+        config = LockingConfig(
+            initial_backoff_ms=100,
+            max_backoff_ms=10000,
+            backoff_multiplier=2.0,
+        )
+        queue = GitHubQueue(token="test-token", config=config)
+
+        backoff = queue._calculate_backoff(1)
+        # 100ms * 2^1 = 200ms + 0-25% jitter = 0.2-0.25s
+        assert 0.2 <= backoff <= 0.25
+
+
+class TestConcurrentClaims:
+    """Tests for concurrent claim scenarios."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_contention_error_raised_on_lost_race(self, mock_httpx_client, sample_work_item):
+        """Test that ContentionError is raised when another worker wins."""
+        config = LockingConfig(bot_login="my-bot")
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
+        mock_assign_response = MagicMock()
+        mock_assign_response.status_code = 201
+
+        mock_verify_response = MagicMock()
+        mock_verify_response.status_code = 200
+        mock_verify_response.json.return_value = {"assignees": [{"login": "other-bot"}]}
+
+        mock_httpx_client.post.return_value = mock_assign_response
+        mock_httpx_client.get.return_value = mock_verify_response
+
+        with pytest.raises(ContentionError) as exc_info:
+            await queue.claim_task(sample_work_item, "sentinel-1")
+
+        assert exc_info.value.issue_number == sample_work_item.issue_number
+        assert exc_info.value.context.get("expected_assignee") == "my-bot"
+        assert exc_info.value.context.get("actual_assignees") == ["other-bot"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_contention_with_multiple_assignees(self, mock_httpx_client, sample_work_item):
+        """Test contention detection with multiple assignees."""
+        config = LockingConfig(bot_login="my-bot")
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
+        mock_assign_response = MagicMock()
+        mock_assign_response.status_code = 201
+
+        mock_verify_response = MagicMock()
+        mock_verify_response.status_code = 200
+        mock_verify_response.json.return_value = {
+            "assignees": [{"login": "bot-1"}, {"login": "bot-2"}]
+        }
+
+        mock_httpx_client.post.return_value = mock_assign_response
+        mock_httpx_client.get.return_value = mock_verify_response
+
+        with pytest.raises(ContentionError) as exc_info:
+            await queue.claim_task(sample_work_item, "sentinel-1")
+
+        assert "bot-1" in exc_info.value.context.get("actual_assignees", [])
+        assert "bot-2" in exc_info.value.context.get("actual_assignees", [])
+
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_empty_assignees_list(self, mock_httpx_client, sample_work_item):
+        """Test contention detection with empty assignees list."""
+        config = LockingConfig(bot_login="my-bot")
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
+        mock_assign_response = MagicMock()
+        mock_assign_response.status_code = 201
+
+        mock_verify_response = MagicMock()
+        mock_verify_response.status_code = 200
+        mock_verify_response.json.return_value = {"assignees": []}
+
+        mock_httpx_client.post.return_value = mock_assign_response
+        mock_httpx_client.get.return_value = mock_verify_response
+
+        with pytest.raises(ContentionError):
+            await queue.claim_task(sample_work_item, "sentinel-1")
+
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_simulated_concurrent_claim_race(self, mock_httpx_client, sample_work_item):
+        """Simulate a race condition between two sentinels."""
+        config = LockingConfig(
+            bot_login="sentinel-a",
+            max_retry_attempts=2,
+            initial_backoff_ms=10,
+        )
+        queue = GitHubQueue(token="test-token", org="test-org", repo="test-repo", config=config)
+        queue._client = mock_httpx_client
+
+        # First attempt: sentinel-a loses race
+        # Second attempt: sentinel-a wins
+        call_count = 0
+
+        def mock_get_side_effect(*_args, **_kwargs):
+            nonlocal call_count
+            call_count += 1
+            response = MagicMock()
+            response.status_code = 200
+            if call_count == 1:
+                response.json.return_value = {"assignees": [{"login": "sentinel-b"}]}
+            else:
+                response.json.return_value = {"assignees": [{"login": "sentinel-a"}]}
+            return response
+
+        mock_assign_response = MagicMock()
+        mock_assign_response.status_code = 201
+
+        mock_delete_response = MagicMock()
+        mock_delete_response.status_code = 200
+
+        mock_httpx_client.post.return_value = mock_assign_response
+        mock_httpx_client.get.side_effect = mock_get_side_effect
+        mock_httpx_client.delete.return_value = mock_delete_response
+
+        result = await queue.claim_task_with_retry(sample_work_item, "sentinel-1")
+
+        assert result is True
+        assert call_count == 2  # Two verification attempts
+
+
+class TestExceptionContext:
+    """Tests for exception context preservation."""
+
+    @pytest.mark.unit
+    def test_assignment_error_preserves_context(self):
+        """Test that AssignmentError preserves context."""
+        error = AssignmentError(
+            "Test error",
+            issue_number=42,
+            status_code=404,
+            bot_login="test-bot",
+        )
+
+        assert error.issue_number == 42
+        assert error.context["status_code"] == 404
+        assert error.context["bot_login"] == "test-bot"
+
+    @pytest.mark.unit
+    def test_contention_error_preserves_context(self):
+        """Test that ContentionError preserves context."""
+        error = ContentionError(
+            "Lost race",
+            issue_number=42,
+            expected_assignee="bot-a",
+            actual_assignees=["bot-b"],
+        )
+
+        assert error.issue_number == 42
+        assert error.context["expected_assignee"] == "bot-a"
+        assert error.context["actual_assignees"] == ["bot-b"]
+
+    @pytest.mark.unit
+    def test_verification_error_preserves_context(self):
+        """Test that VerificationError preserves context."""
+        error = VerificationError(
+            "Verification failed",
+            issue_number=42,
+            status_code=500,
+        )
+
+        assert error.issue_number == 42
+        assert error.context["status_code"] == 500
